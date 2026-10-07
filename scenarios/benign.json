@@ -1,0 +1,44 @@
+{
+  "environment": {
+    "service": "document-api",
+    "route_purpose": "GET /api/files/{owner}/{name} returns a file owned by the authenticated user",
+    "protected_resource": "account files of other users and /private reports",
+    "expected_access": "owner only",
+    "auth_model": "bearer token; actor_id is the authenticated user and must match {owner}",
+    "deployment": "staging",
+    "response_markers": {
+      "own_file_content": "expected",
+      "access_denied": "denial",
+      "ok": "generic",
+      "private_report_content": "protected_content"
+    }
+  },
+  "events": [
+    {
+      "id": "b2",
+      "timestamp": "2026-09-19T09:05:12Z",
+      "actor_id": "user-7",
+      "source_ip": "192.0.2.10",
+      "method": "GET",
+      "path": "/api/files/user-7/report..final.txt",
+      "query": null,
+      "request_body": null,
+      "status": 200,
+      "response_marker": "own_file_content",
+      "response_size": 2310
+    },
+    {
+      "id": "b1",
+      "timestamp": "2026-09-19T09:01:00Z",
+      "actor_id": "user-7",
+      "source_ip": "192.0.2.10",
+      "method": "GET",
+      "path": "/api/files/user-7/notes.txt",
+      "query": null,
+      "request_body": null,
+      "status": 200,
+      "response_marker": "own_file_content",
+      "response_size": 1420
+    }
+  ]
+}

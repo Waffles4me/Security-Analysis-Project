@@ -730,3 +730,48 @@ The source PDF points to these subjects for further reading:
 - Python `unittest`
 
 MITRE ATT&CK T1059 is also listed in the document, but it is more directly relevant to the process/command-investigation project than to the core API Incident Investigator MVP.
+
+---
+
+## 18. Current progress
+
+Last updated: 2026-10-07. Update this section when a step from section 8 is completed.
+
+### Workflow status (section 8)
+
+| Step | Status |
+|---|---|
+| 1. Define the problem | Done. Definitions are in `README.md`. |
+| 2. Input schema and scenarios | Done. `src/models.py`, three scenario files, timeline in the CLI. |
+| 3. Rules, one at a time | Done. A1, A2 and A3 are in `src/rules.py`, combined by `assess()` using the decision table written above it. |
+| 4. Test and run | Done. `python -m unittest discover -s tests` passes (84 tests), including evidence-mutation tests. |
+| 5. Investigation and publication | In progress. See below. |
+
+### Done in step 5
+
+- `examples/output.json` generated from `scenarios/strong_evidence.json`.
+- README documents the rules, A2 parameters, decision table, risk/confidence values and CLI flags.
+- Rules reviewed against sections 3, 5, 10 and 11.
+
+### Still to do
+
+- `investigations/case-01.md`: not written. The repository owner writes it from the actual tool output.
+- README has no limitations / false-positive section yet (required by section 13).
+- Final code review and a clean re-run from the README commands.
+
+### Known evidence gaps found in review (not fixed)
+
+1. A `protected_content` marker on a request that A1 did not flag (e.g. a non-traversal request for another user's file) produces no finding, so the result is `benign`.
+2. A `403` with a `protected_content` marker is reported as blocked (`successful: false`) although the evidence conflicts.
+3. `malicious` is assigned from a response marker alone; intent and authorization are not established, and `missing_context` can be empty in that case.
+4. A3 does not compare `actor_id` with `expected_access` / `auth_model` (the optional authorization-context extension in section 14).
+5. In the malicious case `evidence_event_ids` lists every cited event, not only the ones that support exposure.
+6. A1 does not inspect `request_body` and does not match `..;/`.
+
+### Current results
+
+| Scenario | classification | successful | risk_score | confidence |
+|---|---|---|---|---|
+| `benign.json` | benign | null | 5 | 60 |
+| `suspicious.json` | suspicious | false | 55 | 80 |
+| `strong_evidence.json` | malicious | true | 100 | 85 |

@@ -1,0 +1,57 @@
+{
+  "environment": {
+    "service": "document-api",
+    "route_purpose": "GET /api/files/{owner}/{name} returns a file owned by the authenticated user",
+    "protected_resource": "account files of other users and /private reports",
+    "expected_access": "owner only",
+    "auth_model": "bearer token; actor_id is the authenticated user and must match {owner}",
+    "deployment": "staging",
+    "response_markers": {
+      "own_file_content": "expected",
+      "access_denied": "denial",
+      "ok": "generic",
+      "private_report_content": "protected_content"
+    }
+  },
+  "events": [
+    {
+      "id": "e1",
+      "timestamp": "2026-09-19T11:00:00Z",
+      "actor_id": "user-7",
+      "source_ip": "198.51.100.23",
+      "method": "GET",
+      "path": "/api/files/../../private/report",
+      "query": null,
+      "request_body": null,
+      "status": 403,
+      "response_marker": "access_denied",
+      "response_size": 87
+    },
+    {
+      "id": "e2",
+      "timestamp": "2026-09-19T11:00:06Z",
+      "actor_id": "user-7",
+      "source_ip": "198.51.100.23",
+      "method": "GET",
+      "path": "/api/files/..%2f..%2fprivate/report",
+      "query": null,
+      "request_body": null,
+      "status": 200,
+      "response_marker": "ok",
+      "response_size": 64
+    },
+    {
+      "id": "e3",
+      "timestamp": "2026-09-19T11:00:11Z",
+      "actor_id": "user-7",
+      "source_ip": "198.51.100.23",
+      "method": "GET",
+      "path": "/api/files/..%2f..%2fprivate/report.pdf",
+      "query": null,
+      "request_body": null,
+      "status": 200,
+      "response_marker": "private_report_content",
+      "response_size": 48211
+    }
+  ]
+}
