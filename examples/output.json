@@ -8,11 +8,13 @@
     "e2",
     "e3"
   ],
-  "reason": "A1 found traversal attempt(s) in e1, e2, e3. Exposure supported (A3): e3 returned 200 with marker private_report_content, declared protected_content. That marker is tied to the protected resource (account files of other users and /private reports). Blocked: e1 returned 403 with marker access_denied, declared denial. Outcome unresolved: e2 returned 200 with marker ok, declared generic. The response neither shows blocking nor carries a protected-content marker, and a status such as 200 alone does not prove that protected content was returned. A2 found repeated requests with path variation, which may be probing: 3 requests from 198.51.100.23 within 11 s (e1, e2, e3). This alone does not show malicious intent or exposure.",
+  "reason": "A1 found traversal attempt(s) in e1, e2, e3. Exposure supported (A3): e3 returned 200 with marker private_report_content, declared protected_content. That marker is tied to the protected resource (account files of other users and /private reports). The malicious classification rests on that response marker: it reflects supported exposure, not proven intent or lack of authorization. Blocked: e1 returned 403 with marker access_denied, declared denial. Outcome unresolved: e2 returned 200 with marker ok, declared generic. The response neither shows blocking nor carries a protected-content marker, and a status such as 200 alone does not prove that protected content was returned. A2 found repeated requests with path variation, which may be probing: 3 requests from 198.51.100.23 within 11 s (e1, e2, e3). This alone does not show malicious intent or exposure.",
   "missing_context": [
     "whether 198.51.100.23 is an authorized scanner or test client",
     "event e2: marker 'ok' is generic; response content unknown",
+    "event e3: intent of actor user-7 from source 198.51.100.23 is not established",
+    "event e3: whether the access by actor user-7 from source 198.51.100.23 was authorized (for example sanctioned testing) is not established",
     "response content for e2 cannot be confirmed"
   ],
-  "recommended_action": "Treat e3 as exposure of the protected resource: confirm server-side what was returned, restrict the source and actor, and fix the traversal handling on this route. Confirm whether 198.51.100.23 is an authorized scanner or test client."
+  "recommended_action": "Confirm server-side what was returned for e3 and whether the request was authorized (for example sanctioned testing). If it was not authorized, restrict the source and actor and review how this route handles traversal sequences. Confirm whether 198.51.100.23 is an authorized scanner or test client."
 }

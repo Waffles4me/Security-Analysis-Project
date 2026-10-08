@@ -6,7 +6,8 @@
 - A2 repeated probing   - several requests from one source in a short window
   with path variations. May be an authorized scanner.
 - A3 possible exposure  - a suspicious request whose response carries a marker
-  declared as ``protected_content``. HTTP 200 alone never proves exposure.
+  declared as ``protected_content``. HTTP 200 alone never proves exposure. The
+  same marker on a request A1 did not flag is reported too, but left unresolved.
 
 ``assess`` combines the findings of all three rules using the decision table
 written above it.
@@ -70,6 +71,11 @@ def rule_a1_traversal(scenario: Scenario) -> list[Finding]:
     response shows the request was blocked (401/403, or a marker declared as
     ``denial``) and ``None`` otherwise. A1 never returns ``True``; exposure is
     A3's job.
+
+    When status and marker contradict each other (401/403 with a
+    ``protected_content`` marker, or 2xx with a ``denial`` marker) the evidence
+    does not support blocking, so the outcome is ``None`` and the conflict is
+    recorded in ``details``.
     """
     findings: list[Finding] = []
     for event in scenario.events:
@@ -99,7 +105,21 @@ def rule_a1_traversal(scenario: Scenario) -> list[Finding]:
         elif semantics is None:
             missing.append(f"event {event.id}: semantics of response marker {marker!r} not declared")
 
-        if blocked_by:
+        # Status and marker disagree: neither signal can be trusted on its own.
+        conflict: Optional[dict] = None
+        is_2xx = event.status is not None and 200 <= event.status <= 299
+        if (event.status in BLOCKING_STATUSES and semantics == "protected_content") or (
+            is_2xx and semantics == "denial"
+        ):
+            conflict = {"status": event.status, "marker": marker, "marker_semantics": semantics}
+            missing.append(
+                f"event {event.id}: status {event.status} and marker {marker!r} (declared "
+                f"{semantics}) contradict each other; what was actually returned is unclear"
+            )
+
+        if conflict:
+            outcome = f"response contradictory ({event.status} with marker {marker!r}, declared {semantics})"
+        elif blocked_by:
             signals = []
             if "status" in blocked_by:
                 signals.append(str(event.status))
@@ -114,7 +134,7 @@ def rule_a1_traversal(scenario: Scenario) -> list[Finding]:
             rule_id="A1",
             event_ids=(event.id,),
             summary=f"Traversal attempt in {field_name}; {outcome}.",
-            successful=False if blocked_by else None,
+            successful=False if blocked_by and not conflict else None,
             details={
                 "field": field_name,
                 "raw": raw,
@@ -123,6 +143,7 @@ def rule_a1_traversal(scenario: Scenario) -> list[Finding]:
                 "marker": marker,
                 "marker_semantics": semantics,
                 "blocked_by": blocked_by,
+                "conflict": conflict,
             },
             missing_context=tuple(missing),
         ))
@@ -230,21 +251,32 @@ def rule_a3_exposure(scenario: Scenario, suspicious_ids: set[str]) -> list[Findi
     ``protected_content`` and the environment defines the protected resource.
     Every other 2xx response stays ``None``: HTTP 200 alone never proves
     exposure.
+
+    An event A1 did not flag is examined only when its 2xx response carries a
+    ``protected_content`` marker. That finding is always ``None``: the log shows
+    protected content was returned, not that the actor was not entitled to it.
     """
     environment = scenario.environment
     findings: list[Finding] = []
     for event in scenario.events:
-        if event.id not in suspicious_ids:
-            continue
         if event.status is None or not 200 <= event.status <= 299:
             continue
 
         marker = event.response_marker
         semantics = environment.marker_semantics(marker)
+        flagged = event.id in suspicious_ids
+        if not flagged and semantics != "protected_content":
+            continue
+
         successful: Optional[bool] = None
         missing: list[str] = []
 
-        if marker is None:
+        if not flagged:
+            if environment.protected_resource is None:
+                missing.append("protected_resource not defined")
+            actor = "the actor (actor_id unknown)" if event.actor_id is None else f"actor {event.actor_id!r}"
+            missing.append(f"whether {actor} is entitled to the protected resource is not established")
+        elif marker is None:
             missing.append("no response marker recorded")
         elif semantics is None:
             missing.append(f"marker {marker!r} has no declared semantics")
@@ -265,6 +297,11 @@ def rule_a3_exposure(scenario: Scenario, suspicious_ids: set[str]) -> list[Findi
 
         if successful:
             summary = f"Response carries protected-content marker {marker!r}; exposure supported."
+        elif not flagged:
+            summary = (
+                f"Protected-content marker {marker!r} returned to a request A1 did not flag; "
+                "entitlement of the actor not established."
+            )
         else:
             summary = f"Suspicious request received {event.status}; exposure not established."
 
@@ -274,6 +311,7 @@ def rule_a3_exposure(scenario: Scenario, suspicious_ids: set[str]) -> list[Findi
             summary=summary,
             successful=successful,
             details={
+                "flagged_by_a1": flagged,
                 "status": event.status,
                 "marker": marker,
                 "marker_semantics": semantics,
@@ -288,6 +326,8 @@ def rule_a3_exposure(scenario: Scenario, suspicious_ids: set[str]) -> list[Findi
 # calibrated probabilities. They only rank the cases against each other:
 #   risk 5   no traversal attempt found
 #   risk 40  traversal attempted, every attempt blocked
+#   risk 50  protected content returned to a request A1 did not flag; whether
+#            the actor was entitled to it is not established
 #   risk 60  traversal attempted, at least one outcome unresolved
 #   risk 85  a traversal attempt returned a protected-content marker
 #   +15      a probing burst (A2) was also found, capped at 100. So probing
@@ -301,12 +341,14 @@ def rule_a3_exposure(scenario: Scenario, suspicious_ids: set[str]) -> list[Findi
 # (a documented field, or the response_markers declarations) is missing.
 RISK_NO_FINDINGS = 5
 RISK_ALL_BLOCKED = 40
+RISK_UNFLAGGED_PROTECTED = 50
 RISK_UNRESOLVED = 60
 RISK_EXPOSURE = 85
 RISK_PROBING_BONUS = 15
 CONFIDENCE_NO_FINDINGS = 60
 CONFIDENCE_ALL_BLOCKED = 80
 CONFIDENCE_UNRESOLVED = 50
+CONFIDENCE_UNFLAGGED_PROTECTED = 50
 CONFIDENCE_PROBING_ONLY = 50
 CONFIDENCE_EXPOSURE = 85
 CONFIDENCE_PENALTY_INCOMPLETE_ENVIRONMENT = 20
@@ -324,16 +366,28 @@ def _response_signal(event: Event, semantics: Optional[str]) -> str:
     return f"{event.id} returned {status} with {marker}"
 
 
-# Decision table, applied in order. "A1 outcome" is per traversal attempt: when
-# A3 also examined the event (2xx response), A3's reading of the response is
-# used, so a contradictory response (e.g. 200 with a denial marker) counts as
-# unresolved rather than blocked.
+def _who(event: Event) -> str:
+    """The actor and source of one event, saying so when either is not recorded."""
+    actor = "an unknown actor" if event.actor_id is None else f"actor {event.actor_id}"
+    source = "an unknown source" if event.source_ip is None else f"source {event.source_ip}"
+    return f"{actor} from {source}"
+
+
+# Decision table, applied in order. "A1 outcome" is per traversal attempt. A
+# contradictory response (403 with a protected-content marker, 200 with a denial
+# marker) is unresolved in A1 itself, so it never counts as blocked.
 #
 #   1. any A3 finding True          -> malicious,  successful True
 #   2. any A1 outcome unresolved    -> suspicious, successful None
-#   3. all A1 outcomes blocked      -> suspicious, successful False
-#   4. only A2 findings             -> suspicious, successful None
-#   5. no findings                  -> benign,     successful None
+#   3. protected content returned
+#      to a request A1 did not flag -> suspicious, successful None
+#   4. all A1 outcomes blocked      -> suspicious, successful False
+#   5. only A2 findings             -> suspicious, successful None
+#   6. no findings                  -> benign,     successful None
+#
+#   Rule 3 sits above rule 4 so that blocked traversal elsewhere in the log
+#   cannot report successful False while protected content went out on
+#   another request.
 #
 #   Override: findings exist, but environment.protected_resource or
 #   environment.response_markers is missing -> classification
@@ -341,10 +395,14 @@ def _response_signal(event: Event, semantics: Optional[str]) -> str:
 #   anyway: A3 never returns True without a protected resource and a declared
 #   protected_content marker.
 #
+#   "malicious" (rule 1) means exposure is supported by a protected-content
+#   marker. It does not claim intent or missing authorization; both are always
+#   listed in missing_context for the exposed event(s).
+#
 #   A2 never sets "successful" and never makes the classification malicious; it
 #   adds risk and the authorized-scanner question.
 #   evidence_event_ids is every event cited by a finding, in timeline order
-#   (rule 5: every event reviewed).
+#   (rule 6: every event reviewed).
 def assess(scenario: Scenario) -> tuple[Assessment, list[Finding]]:
     """Produce the overall assessment for a validated scenario, plus the findings behind it."""
     environment = scenario.environment
@@ -362,11 +420,12 @@ def assess(scenario: Scenario) -> tuple[Assessment, list[Finding]]:
     a1_outcome = {f.event_ids[0]: f.successful for f in a1_findings}
     a3_outcome = {f.event_ids[0]: f.successful for f in a3_findings}
     exposed_ids = [eid for eid in a1_ids if a3_outcome.get(eid) is True]
-    unresolved_ids = [
-        eid for eid in a1_ids
-        if (a3_outcome[eid] is None if eid in a3_outcome else a1_outcome[eid] is None)
-    ]
+    unresolved_ids = [eid for eid in a1_ids if a1_outcome[eid] is None and eid not in exposed_ids]
     blocked_ids = [eid for eid in a1_ids if eid not in exposed_ids and eid not in unresolved_ids]
+    # Unresolved because status and marker contradict each other.
+    conflict_ids = [f.event_ids[0] for f in a1_findings if f.details["conflict"]]
+    # Protected-content responses to requests A1 did not flag.
+    unflagged_ids = [f.event_ids[0] for f in a3_findings if not f.details["flagged_by_a1"]]
 
     # Union of every cited event, de-duplicated, in timeline order.
     cited = {eid for f in findings for eid in f.event_ids}
@@ -392,7 +451,7 @@ def assess(scenario: Scenario) -> tuple[Assessment, list[Finding]]:
         action = "Provide request/response events for the time range under investigation."
         missing.append("no events provided")
     elif not findings:
-        # Rule 5.
+        # Rule 6.
         classification, successful = "benign", None
         risk, confidence = RISK_NO_FINDINGS, CONFIDENCE_NO_FINDINGS - penalty
         evidence = [event.id for event in scenario.events]
@@ -402,8 +461,8 @@ def assess(scenario: Scenario) -> tuple[Assessment, list[Finding]]:
             "and no burst of varied requests from one source."
         )
         action = "No action required based on these events."
-    elif not a1_findings:
-        # Rule 4: activity worth a look, but no attempt on the protected resource was found.
+    elif not a1_findings and not unflagged_ids:
+        # Rule 5: activity worth a look, but no attempt on the protected resource was found.
         classification, successful = "suspicious", None
         risk, confidence = RISK_NO_FINDINGS, CONFIDENCE_PROBING_ONLY - penalty
         evidence = cited_ids
@@ -411,20 +470,35 @@ def assess(scenario: Scenario) -> tuple[Assessment, list[Finding]]:
         action = ""
     else:
         evidence = cited_ids
-        reason = f"A1 found traversal attempt(s) in {', '.join(a1_ids)}."
+        if a1_ids:
+            reason = f"A1 found traversal attempt(s) in {', '.join(a1_ids)}."
+        else:
+            reason = "No traversal indicator was found in any path or query after bounded decoding."
         if exposed_ids:
             # Rule 1.
             classification, successful = "malicious", True
             risk, confidence = RISK_EXPOSURE, CONFIDENCE_EXPOSURE - penalty
             reason += (
                 f" Exposure supported (A3): {signals(exposed_ids)}. That marker is tied to the "
-                f"protected resource ({environment.protected_resource})."
+                f"protected resource ({environment.protected_resource}). The malicious "
+                "classification rests on that response marker: it reflects supported exposure, "
+                "not proven intent or lack of authorization."
             )
             action = (
-                f"Treat {', '.join(exposed_ids)} as exposure of the protected resource: confirm "
-                "server-side what was returned, restrict the source and actor, and fix the "
-                "traversal handling on this route."
+                f"Confirm server-side what was returned for {', '.join(exposed_ids)} and whether "
+                "the request was authorized (for example sanctioned testing). If it was not "
+                "authorized, restrict the source and actor and review how this route handles "
+                "traversal sequences."
             )
+            # The marker supports exposure only. Who did it, why, and whether
+            # they were permitted to is not in the log.
+            for event in map(scenario.get_event, exposed_ids):
+                who = _who(event)
+                missing.append(f"event {event.id}: intent of {who} is not established")
+                missing.append(
+                    f"event {event.id}: whether the access by {who} was authorized "
+                    "(for example sanctioned testing) is not established"
+                )
         elif unresolved_ids:
             # Rule 2.
             classification, successful = "suspicious", None
@@ -433,8 +507,13 @@ def assess(scenario: Scenario) -> tuple[Assessment, list[Finding]]:
                 f"Determine what was actually returned for {', '.join(unresolved_ids)} "
                 "(server-side logs or response content summary) before concluding exposure."
             )
+        elif unflagged_ids:
+            # Rule 3. The action is added below, with the reason.
+            classification, successful = "suspicious", None
+            risk, confidence = RISK_UNFLAGGED_PROTECTED, CONFIDENCE_UNFLAGGED_PROTECTED - penalty
+            action = ""
         else:
-            # Rule 3.
+            # Rule 4.
             classification, successful = "suspicious", False
             risk, confidence = RISK_ALL_BLOCKED, CONFIDENCE_ALL_BLOCKED - penalty
             action = (
@@ -444,15 +523,33 @@ def assess(scenario: Scenario) -> tuple[Assessment, list[Finding]]:
 
         if blocked_ids:
             reason += f" Blocked: {signals(blocked_ids)}."
-            if not exposed_ids and not unresolved_ids:
+            if not exposed_ids and not unresolved_ids and not unflagged_ids:
                 reason += " Exposure of the protected resource is not supported for these requests."
         if unresolved_ids:
-            reason += (
-                f" Outcome unresolved: {signals(unresolved_ids)}. The response neither shows "
-                "blocking nor carries a protected-content marker, and a status such as 200 alone "
-                "does not prove that protected content was returned."
-            )
+            plain_ids = [eid for eid in unresolved_ids if eid not in conflict_ids]
+            if plain_ids:
+                reason += (
+                    f" Outcome unresolved: {signals(plain_ids)}. The response neither shows "
+                    "blocking nor carries a protected-content marker, and a status such as 200 "
+                    "alone does not prove that protected content was returned."
+                )
+            if conflict_ids:
+                reason += (
+                    f" Contradictory response: {signals(conflict_ids)}. The status and the marker "
+                    "disagree, so neither blocking nor exposure is supported."
+                )
             missing.append(f"response content for {', '.join(unresolved_ids)} cannot be confirmed")
+        if unflagged_ids:
+            # Reported under every rule, so a higher rule does not hide it.
+            reason += (
+                f" Protected-content marker on a request A1 did not flag: {signals(unflagged_ids)}. "
+                "The log does not show whether the actor was entitled to that content, so "
+                "improper exposure is neither supported nor ruled out."
+            )
+            action = (
+                f"{action} Establish whether the actor behind {', '.join(unflagged_ids)} is "
+                "entitled to the protected resource (authorization records for that request)."
+            ).strip()
 
     if a2_findings:
         risk = min(100, risk + RISK_PROBING_BONUS)

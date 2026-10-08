@@ -123,6 +123,68 @@ class TraversalAttemptA1Test(unittest.TestCase):
             ("event s1: response status missing", "event s1: response marker missing"),
         )
 
+    def suspicious_with_s1(self, keep_only_s1=False, **changes):
+        data = json.loads((SCENARIOS / "suspicious.json").read_text(encoding="utf-8"))
+        next(event for event in data["events"] if event["id"] == "s1").update(changes)
+        if keep_only_s1:
+            data["events"] = [event for event in data["events"] if event["id"] == "s1"]
+        return self.findings_by_event(Scenario.from_dict(data))
+
+    def test_403_with_protected_content_marker_is_a_conflict_not_blocked(self):
+        findings = self.suspicious_with_s1(response_marker="private_report_content")
+        s1 = findings["s1"]
+        self.assertIsNone(s1.successful)
+        self.assertEqual(s1.details["conflict"], {
+            "status": 403,
+            "marker": "private_report_content",
+            "marker_semantics": "protected_content",
+        })
+        self.assertEqual(
+            s1.summary,
+            "Traversal attempt in path; response contradictory "
+            "(403 with marker 'private_report_content', declared protected_content).",
+        )
+        self.assertEqual(s1.missing_context, (
+            "event s1: status 403 and marker 'private_report_content' (declared protected_content) "
+            "contradict each other; what was actually returned is unclear",
+        ))
+        # The other events are untouched and still blocked.
+        self.assertIs(findings["s2"].successful, False)
+        self.assertIs(findings["s3"].successful, False)
+
+    def test_401_with_protected_content_marker_is_a_conflict(self):
+        s1 = self.suspicious_with_s1(status=401, response_marker="private_report_content")["s1"]
+        self.assertIsNone(s1.successful)
+        self.assertEqual(s1.details["conflict"]["status"], 401)
+
+    def test_2xx_with_denial_marker_is_a_conflict_not_blocked(self):
+        s1 = self.suspicious_with_s1(keep_only_s1=True, status=200)["s1"]
+        self.assertIsNone(s1.successful)
+        self.assertEqual(s1.details["conflict"], {
+            "status": 200,
+            "marker": "access_denied",
+            "marker_semantics": "denial",
+        })
+        self.assertIn("contradictory", s1.summary)
+        self.assertTrue(any("what was actually returned is unclear" in note for note in s1.missing_context))
+
+    def test_blocking_status_with_non_conflicting_marker_stays_blocked(self):
+        # denial, generic, undeclared, missing.
+        for marker in ("access_denied", "ok", "foo", None):
+            for status in (401, 403):
+                with self.subTest(status=status, marker=marker):
+                    s1 = self.suspicious_with_s1(status=status, response_marker=marker)["s1"]
+                    self.assertIs(s1.successful, False)
+                    self.assertIsNone(s1.details["conflict"])
+
+    def test_denial_marker_on_other_non_2xx_status_stays_blocked(self):
+        for status in (None, 302, 404, 500):
+            with self.subTest(status=status):
+                s1 = self.suspicious_with_s1(status=status)["s1"]
+                self.assertIs(s1.successful, False)
+                self.assertEqual(s1.details["blocked_by"], ["marker"])
+                self.assertIsNone(s1.details["conflict"])
+
     def test_unresolved_statuses_never_assert_an_outcome(self):
         for status in (200, 204, 302, 404, 500):
             with self.subTest(status=status):
@@ -307,7 +369,8 @@ class PossibleExposureA3Test(unittest.TestCase):
         self.assertEqual(self.exposure(Scenario.load(SCENARIOS / "suspicious.json")), {})
 
     def test_benign_has_no_a3_findings(self):
-        # b1/b2 are 200 responses, but the requests are not suspicious.
+        # b1/b2 are 200 responses to unflagged requests, and their marker is
+        # declared "expected", not "protected_content".
         self.assertEqual(self.exposure(Scenario.load(SCENARIOS / "benign.json")), {})
 
     def test_mutation_generic_marker_true_to_none(self):
@@ -357,13 +420,55 @@ class PossibleExposureA3Test(unittest.TestCase):
     def test_other_2xx_statuses_are_considered(self):
         self.assertIs(self.mutated_e3(status=206).successful, True)
 
-    def test_protected_marker_on_non_suspicious_event_is_not_a_finding(self):
+    def test_protected_marker_on_unflagged_event_is_an_unresolved_finding(self):
+        data = self.raw("benign.json")
+        data["events"][0]["response_marker"] = "private_report_content"  # b2
+        findings = self.exposure(Scenario.from_dict(data))
+        self.assertEqual(sorted(findings), ["b2"])
+        b2 = findings["b2"]
+        # Protected content was returned; that the access was improper is not shown.
+        self.assertIsNone(b2.successful)
+        self.assertIs(b2.details["flagged_by_a1"], False)
+        self.assertEqual(
+            b2.missing_context,
+            ("event b2: whether actor 'user-7' is entitled to the protected resource is not established",),
+        )
+
+    def test_unflagged_event_with_unknown_actor_says_so(self):
+        data = self.raw("benign.json")
+        data["events"][0].update(response_marker="private_report_content", actor_id=None)
+        b2 = self.exposure(Scenario.from_dict(data))["b2"]
+        self.assertIsNone(b2.successful)
+        self.assertEqual(
+            b2.missing_context,
+            ("event b2: whether the actor (actor_id unknown) is entitled to the protected resource "
+             "is not established",),
+        )
+
+    def test_unflagged_event_without_protected_resource_is_never_true(self):
         data = self.raw("benign.json")
         data["events"][0]["response_marker"] = "private_report_content"
-        self.assertEqual(self.exposure(Scenario.from_dict(data)), {})
+        del data["environment"]["protected_resource"]
+        b2 = self.exposure(Scenario.from_dict(data))["b2"]
+        self.assertIsNone(b2.successful)
+        self.assertIn("event b2: protected_resource not defined", b2.missing_context)
 
-    def test_a2_only_events_are_not_suspicious_enough(self):
-        # Three plain requests form an A2 burst; one returns the protected marker.
+    def test_unflagged_events_need_2xx_and_a_protected_content_marker(self):
+        for changes in ({"status": 403}, {"status": None}, {"response_marker": "ok"},
+                        {"response_marker": "foo"}, {"response_marker": None}):
+            with self.subTest(changes=changes):
+                data = self.raw("benign.json")
+                data["events"][0]["response_marker"] = "private_report_content"
+                data["events"][0].update(changes)
+                self.assertEqual(self.exposure(Scenario.from_dict(data)), {})
+
+    def test_flagged_findings_are_marked_as_flagged(self):
+        findings = self.exposure(Scenario.load(SCENARIOS / "strong_evidence.json"))
+        self.assertIs(findings["e2"].details["flagged_by_a1"], True)
+        self.assertIs(findings["e3"].details["flagged_by_a1"], True)
+
+    def test_a2_only_events_with_protected_marker_are_unresolved_findings(self):
+        # Three plain requests form an A2 burst; each returns the protected marker.
         data = self.raw("benign.json")
         template = data["events"][0]
         data["events"] = [
@@ -373,7 +478,12 @@ class PossibleExposureA3Test(unittest.TestCase):
         ]
         scenario = Scenario.from_dict(data)
         self.assertEqual(len(rule_a2_probing(scenario)), 1)
-        self.assertEqual(self.exposure(scenario), {})
+        findings = self.exposure(scenario)
+        self.assertEqual(sorted(findings), ["p0", "p1", "p2"])
+        for finding in findings.values():
+            # Being part of a burst does not make the request an attempt.
+            self.assertIsNone(finding.successful)
+            self.assertIs(finding.details["flagged_by_a1"], False)
 
 
 class EndToEndAssessTest(unittest.TestCase):
@@ -450,6 +560,8 @@ class EndToEndAssessTest(unittest.TestCase):
                 "Exposure supported (A3): e3 returned 200 with marker private_report_content, "
                 "declared protected_content. That marker is tied to the protected resource "
                 "(account files of other users and /private reports). "
+                "The malicious classification rests on that response marker: it reflects "
+                "supported exposure, not proven intent or lack of authorization. "
                 "Blocked: e1 returned 403 with marker access_denied, declared denial. "
                 "Outcome unresolved: e2 returned 200 with marker ok, declared generic. "
                 "The response neither shows blocking nor carries a protected-content marker, and "
@@ -461,14 +573,75 @@ class EndToEndAssessTest(unittest.TestCase):
             "missing_context": [
                 "whether 198.51.100.23 is an authorized scanner or test client",
                 "event e2: marker 'ok' is generic; response content unknown",
+                "event e3: intent of actor user-7 from source 198.51.100.23 is not established",
+                "event e3: whether the access by actor user-7 from source 198.51.100.23 was "
+                "authorized (for example sanctioned testing) is not established",
                 "response content for e2 cannot be confirmed",
             ],
             "recommended_action": (
-                "Treat e3 as exposure of the protected resource: confirm server-side what was "
-                "returned, restrict the source and actor, and fix the traversal handling on this "
-                "route. Confirm whether 198.51.100.23 is an authorized scanner or test client."
+                "Confirm server-side what was returned for e3 and whether the request was "
+                "authorized (for example sanctioned testing). If it was not authorized, restrict "
+                "the source and actor and review how this route handles traversal sequences. "
+                "Confirm whether 198.51.100.23 is an authorized scanner or test client."
             ),
         })
+
+    def test_single_exposed_event_is_malicious_with_intent_and_authorization_unresolved(self):
+        # e3 alone: no probing burst, no other unresolved event.
+        data = self.raw("strong_evidence.json")
+        data["events"] = [e for e in data["events"] if e["id"] == "e3"]
+        result = self.run_assess(data)
+        self.assertEqual(result["classification"], "malicious")
+        self.assertIs(result["successful"], True)
+        self.assertEqual(result["missing_context"], [
+            "event e3: intent of actor user-7 from source 198.51.100.23 is not established",
+            "event e3: whether the access by actor user-7 from source 198.51.100.23 was "
+            "authorized (for example sanctioned testing) is not established",
+        ])
+        self.assertIn("supported exposure, not proven intent", result["reason"])
+        self.assertTrue(result["recommended_action"].startswith(
+            "Confirm server-side what was returned for e3 and whether the request was authorized"
+        ))
+        # The action must not assert a confirmed vulnerability.
+        self.assertNotIn("fix", result["recommended_action"])
+
+    def test_exposed_event_with_unknown_actor_or_source_does_not_name_one(self):
+        data = self.raw("strong_evidence.json")
+        e3 = next(e for e in data["events"] if e["id"] == "e3")
+        e3["actor_id"] = None
+        result = self.run_assess(data)
+        self.assertEqual(result["classification"], "malicious")
+        self.assertIn(
+            "event e3: intent of an unknown actor from source 198.51.100.23 is not established",
+            result["missing_context"],
+        )
+        self.assertIn(
+            "event e3: whether the access by an unknown actor from source 198.51.100.23 was "
+            "authorized (for example sanctioned testing) is not established",
+            result["missing_context"],
+        )
+        for note in result["missing_context"]:
+            if note.startswith("event e3:"):
+                self.assertNotIn("user-7", note)
+
+        e3["source_ip"] = None
+        result = self.run_assess(data)
+        self.assertIn(
+            "event e3: intent of an unknown actor from an unknown source is not established",
+            result["missing_context"],
+        )
+
+    def test_malicious_never_has_empty_missing_context(self):
+        # Row 1 in every shape the tests build: alone, with a burst, with other events.
+        full = self.raw("strong_evidence.json")
+        alone = self.raw("strong_evidence.json")
+        alone["events"] = [e for e in alone["events"] if e["id"] == "e3"]
+        for data in (full, alone):
+            result = self.run_assess(data)
+            self.assertEqual(result["classification"], "malicious")
+            notes = [n for n in result["missing_context"] if n.startswith("event e3:")]
+            self.assertTrue(any("intent of" in n for n in notes))
+            self.assertTrue(any("was authorized" in n for n in notes))
 
     def test_strong_evidence_without_e3_is_unresolved(self):
         data = self.raw("strong_evidence.json")
@@ -533,7 +706,7 @@ class EndToEndAssessTest(unittest.TestCase):
         self.assertIn("environment.response_markers not provided", result["missing_context"])
 
     def test_200_with_denial_marker_is_unresolved_not_blocked(self):
-        # A1 alone reads the denial marker as blocking; the 200 contradicts it.
+        # The denial marker suggests blocking; the 200 contradicts it.
         data = self.raw("suspicious.json")
         data["events"] = data["events"][:1]
         data["events"][0]["status"] = 200
@@ -541,6 +714,130 @@ class EndToEndAssessTest(unittest.TestCase):
         self.assertEqual(result["classification"], "suspicious")
         self.assertIsNone(result["successful"])
         self.assertTrue(any("contradicts" in note for note in result["missing_context"]))
+        self.assertIn("Contradictory response: s1 returned 200", result["reason"])
+
+    def test_403_with_protected_content_marker_is_unresolved_not_blocked(self):
+        data = self.raw("suspicious.json")
+        next(e for e in data["events"] if e["id"] == "s1")["response_marker"] = "private_report_content"
+        scenario = Scenario.from_dict(data)
+        _, findings = assess(scenario)
+        self.assertNotIn(True, [f.successful for f in findings])
+        a1 = {f.event_ids[0]: f.successful for f in findings if f.rule_id == "A1"}
+        self.assertEqual(a1, {"s1": None, "s2": False, "s3": False})
+
+        result = self.run_assess(data)
+        self.assertEqual(result["classification"], "suspicious")
+        self.assertIsNone(result["successful"])
+        # 60 for an unresolved traversal attempt + 15 for the probing burst.
+        self.assertEqual(result["risk_score"], 75)
+        self.assertIn(
+            "Contradictory response: s1 returned 403 with marker private_report_content, "
+            "declared protected_content. The status and the marker disagree, so neither blocking "
+            "nor exposure is supported.",
+            result["reason"],
+        )
+        self.assertIn("Blocked: s2 returned 403", result["reason"])
+        # The wording for an ordinary unresolved response would be false here.
+        self.assertNotIn("nor carries a protected-content marker", result["reason"])
+        self.assertIn(
+            "event s1: status 403 and marker 'private_report_content' (declared protected_content) "
+            "contradict each other; what was actually returned is unclear",
+            result["missing_context"],
+        )
+
+    def test_protected_marker_on_unflagged_request_is_suspicious_not_benign(self):
+        data = self.raw("benign.json")
+        data["events"][0]["response_marker"] = "private_report_content"  # b2
+        scenario = Scenario.from_dict(data)
+        _, findings = assess(scenario)
+        self.assertEqual([(f.rule_id, f.event_ids, f.successful) for f in findings], [("A3", ("b2",), None)])
+        self.assertEqual(self.run_assess(data), {
+            "classification": "suspicious",
+            "risk_score": 50,
+            "confidence": 50,
+            "successful": None,
+            "evidence_event_ids": ["b2"],
+            "reason": (
+                "No traversal indicator was found in any path or query after bounded decoding. "
+                "Protected-content marker on a request A1 did not flag: b2 returned 200 with "
+                "marker private_report_content, declared protected_content. The log does not show "
+                "whether the actor was entitled to that content, so improper exposure is neither "
+                "supported nor ruled out."
+            ),
+            "missing_context": [
+                "event b2: whether actor 'user-7' is entitled to the protected resource is not established",
+            ],
+            "recommended_action": (
+                "Establish whether the actor behind b2 is entitled to the protected resource "
+                "(authorization records for that request)."
+            ),
+        })
+
+    def test_unflagged_protected_marker_without_protected_resource_is_insufficient_data(self):
+        data = self.raw("benign.json")
+        data["events"][0]["response_marker"] = "private_report_content"
+        del data["environment"]["protected_resource"]
+        _, findings = assess(Scenario.from_dict(data))
+        self.assertEqual([f.successful for f in findings], [None])
+        result = self.run_assess(data)
+        self.assertEqual(result["classification"], "insufficient_data")
+        self.assertIsNone(result["successful"])
+        self.assertIn("event b2: protected_resource not defined", result["missing_context"])
+        self.assertIn("environment.protected_resource not provided", result["missing_context"])
+
+    def test_blocked_traversal_plus_unflagged_protected_marker_is_not_reported_blocked(self):
+        # Every traversal attempt in suspicious.json is blocked (successful False
+        # on its own). One later, unflagged request returns protected content.
+        data = self.raw("suspicious.json")
+        data["events"].append({
+            "id": "s4",
+            "timestamp": "2026-09-19T10:05:00Z",
+            "actor_id": "user-7",
+            "source_ip": "192.0.2.10",
+            "method": "GET",
+            "path": "/api/files/user-9/report.pdf",
+            "status": 200,
+            "response_marker": "private_report_content",
+        })
+        result = self.run_assess(data)
+        self.assertEqual(result["classification"], "suspicious")
+        self.assertIsNone(result["successful"])
+        # 50 for the unflagged protected-content response + 15 for the s1-s3 burst.
+        self.assertEqual(result["risk_score"], 65)
+        self.assertEqual(result["confidence"], 50)
+        self.assertEqual(result["evidence_event_ids"], ["s1", "s2", "s3", "s4"])
+        self.assertIn("Blocked: s1 returned 403", result["reason"])
+        self.assertIn(
+            "s4 returned 200 with marker private_report_content, declared protected_content",
+            result["reason"],
+        )
+        self.assertIn(
+            "event s4: whether actor 'user-7' is entitled to the protected resource is not established",
+            result["missing_context"],
+        )
+
+    def test_unflagged_protected_marker_does_not_change_a_supported_exposure(self):
+        data = self.raw("strong_evidence.json")
+        data["events"].append({
+            "id": "e4",
+            "timestamp": "2026-09-19T11:10:00Z",
+            "actor_id": None,
+            "source_ip": "198.51.100.23",
+            "method": "GET",
+            "path": "/api/files/user-9/report.pdf",
+            "status": 200,
+            "response_marker": "private_report_content",
+        })
+        result = self.run_assess(data)
+        self.assertEqual(result["classification"], "malicious")
+        self.assertIs(result["successful"], True)
+        # Still surfaced, not hidden by the higher row.
+        self.assertIn("e4 returned 200", result["reason"])
+        self.assertIn(
+            "event e4: whether the actor (actor_id unknown) is entitled to the protected resource "
+            "is not established",
+            result["missing_context"],
+        )
 
     def test_only_strong_evidence_is_ever_malicious_or_successful(self):
         for name in ("benign.json", "suspicious.json"):

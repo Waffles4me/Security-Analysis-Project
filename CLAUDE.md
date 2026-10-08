@@ -735,7 +735,7 @@ MITRE ATT&CK T1059 is also listed in the document, but it is more directly relev
 
 ## 18. Current progress
 
-Last updated: 2026-10-07. Update this section when a step from section 8 is completed.
+Last updated: 2026-10-08. Update this section when a step from section 8 is completed.
 
 ### Workflow status (section 8)
 
@@ -744,29 +744,48 @@ Last updated: 2026-10-07. Update this section when a step from section 8 is comp
 | 1. Define the problem | Done. Definitions are in `README.md`. |
 | 2. Input schema and scenarios | Done. `src/models.py`, three scenario files, timeline in the CLI. |
 | 3. Rules, one at a time | Done. A1, A2 and A3 are in `src/rules.py`, combined by `assess()` using the decision table written above it. |
-| 4. Test and run | Done. `python -m unittest discover -s tests` passes (84 tests), including evidence-mutation tests. |
-| 5. Investigation and publication | In progress. See below. |
+| 4. Test and run | Done. `python -m unittest discover -s tests` passes (101 tests), including evidence-mutation tests. |
+| 5. Investigation and publication | In progress. Blocked on `investigations/case-01.md`. See below. |
 
 ### Done in step 5
 
 - `examples/output.json` generated from `scenarios/strong_evidence.json`.
 - README documents the rules, A2 parameters, decision table, risk/confidence values and CLI flags.
 - Rules reviewed against sections 3, 5, 10 and 11.
+- Three evidence gaps fixed in `src/rules.py`, each with tests and README updates:
+  - A `protected_content` marker on a request A1 did not flag now gives an A3 finding with `successful: null` and the result `suspicious` (new decision row 3, risk 50, confidence 50). It was `benign`.
+  - A response whose status and marker contradict each other (`401`/`403` with a `protected_content` marker, `2xx` with a `denial` marker) is now `null` in A1 with the conflict recorded. It was reported as blocked.
+  - `malicious` always lists the intent and the authorization of the actor and source as not established in `missing_context`, and the recommended action asks to confirm both first.
+- `examples/output.json` regenerated after those changes; it equals the current `--json-only` output.
+- README has "The problem" and "Limitations and false positives" sections; every item in section 13 is covered.
+- Final code review done (2026-10-08). Its open findings are listed below.
+- Clean re-run done (2026-10-08): every command in the README "Usage" and "Tests" sections works from a fresh copy of the repository, on all three scenario files.
 
 ### Still to do
 
-- `investigations/case-01.md`: not written. The repository owner writes it from the actual tool output.
-- README has no limitations / false-positive section yet (required by section 13).
-- Final code review and a clean re-run from the README commands.
+- `investigations/case-01.md`: not written. The repository owner writes it from the actual tool output. This is the only item of section 16 that is plainly missing.
+- Fix the open review findings below. The prompts for this are in `docs/prompts-review-fixes.md` (X1 to X4; X5 is optional and covers finding 5).
 
-### Known evidence gaps found in review (not fixed)
+### Known gaps documented as limitations in the README (not fixed)
 
-1. A `protected_content` marker on a request that A1 did not flag (e.g. a non-traversal request for another user's file) produces no finding, so the result is `benign`.
-2. A `403` with a `protected_content` marker is reported as blocked (`successful: false`) although the evidence conflicts.
-3. `malicious` is assigned from a response marker alone; intent and authorization are not established, and `missing_context` can be empty in that case.
-4. A3 does not compare `actor_id` with `expected_access` / `auth_model` (the optional authorization-context extension in section 14).
-5. In the malicious case `evidence_event_ids` lists every cited event, not only the ones that support exposure.
-6. A1 does not inspect `request_body` and does not match `..;/`.
+1. A3 does not compare `actor_id` with `expected_access` / `auth_model` (the optional authorization-context extension in section 14).
+2. In the malicious case `evidence_event_ids` lists every cited event, not only the ones that support exposure.
+3. A1 does not inspect `request_body` and does not match `..;/`, `..%00`, overlong UTF-8, `....//` or payloads encoded more than twice.
+4. "Blocked" can rest on one signal: a `401`/`403` with no marker, or a `denial` marker on a `404`, `5xx` or missing status.
+5. A2 flags ordinary use, such as one user opening three different files within a minute (`suspicious`, risk 20).
+
+### Open findings from the final code review (not fixed, not yet documented)
+
+1. A traversal request answered with a non-`2xx` status other than `401`/`403` and a `protected_content` marker gets a reason that says the response does not carry a protected-content marker. The outcome (`null`) is right; the text is false.
+2. A log in which no event has a status or marker and no rule matches is `benign`, confidence 60, with an empty `missing_context`.
+3. A `403` with a marker declared `expected` is reported as blocked; it is not treated as a conflict.
+4. An empty-string `protected_resource` counts as defined, so `successful: true` is possible with no named resource. An empty-string `actor_id` is treated as a known actor.
+5. A traversal attempt with `actor_id: null` (for example `s3`) does not put the unknown actor in `missing_context`.
+6. Input validation: a non-string marker meaning and a non-UTF-8 file raise a traceback instead of a validation error; `response_markers` set to `[]`, `0`, `""` or `false` is accepted as empty; a UTF-8 file with a byte-order mark is rejected.
+7. `Assessment.validate` accepts `1` and `0` for `successful`.
+8. A2's summary says "distinct paths" when only the query differs.
+9. Tests: no test for the CLI error exit code, none that `examples/output.json` matches the tool; `PlaceholderAssessTest` and `test_no_placeholder_or_pending_notes_remain` are stale.
+10. `src/cli.py` computes an unused `widths` variable in `format_timeline`.
 
 ### Current results
 
